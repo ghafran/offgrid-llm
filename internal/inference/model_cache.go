@@ -26,9 +26,60 @@ type ModelInstance struct {
 	ModelID       string
 	Port          int
 	Cmd           *exec.Cmd
+	ExitDone      chan struct{}
+	ExitErr       error
+	exitMu        sync.Mutex
 	LastAccess    time.Time
 	ModelPath     string // For restart purposes
 	ProjectorPath string // For VLM restart
+}
+
+func (mi *ModelInstance) startExitWatcher() {
+	if mi == nil || mi.Cmd == nil {
+		return
+	}
+	go func() {
+		err := mi.Cmd.Wait()
+		mi.exitMu.Lock()
+		mi.ExitErr = err
+		mi.exitMu.Unlock()
+		close(mi.ExitDone)
+	}()
+}
+
+func (mi *ModelInstance) exitStatus() (error, bool) {
+	if mi == nil || mi.ExitDone == nil {
+		return nil, false
+	}
+	select {
+	case <-mi.ExitDone:
+		mi.exitMu.Lock()
+		defer mi.exitMu.Unlock()
+		return mi.ExitErr, true
+	default:
+		return nil, false
+	}
+}
+
+func (mi *ModelInstance) waitForExit(timeout time.Duration) (error, bool) {
+	if mi == nil || mi.ExitDone == nil {
+		return nil, true
+	}
+	select {
+	case <-mi.ExitDone:
+		mi.exitMu.Lock()
+		defer mi.exitMu.Unlock()
+		return mi.ExitErr, true
+	case <-time.After(timeout):
+		return nil, false
+	}
+}
+
+func processExitMessage(err error) string {
+	if err == nil {
+		return "exit status 0"
+	}
+	return err.Error()
 }
 
 // ModelCache manages multiple llama-server instances for fast model switching
@@ -342,8 +393,14 @@ func (mc *ModelCache) shouldUseMlock(modelPath string) bool {
 		return false
 	}
 
-	// Smart mlock: check if we have enough RAM
-	if mc.totalRAMMB <= 0 {
+	// Smart mlock: check if the actual runtime has enough RAM. In Docker, the
+	// user-configured RAM override may be larger than the container limit that
+	// llama-server sees, so use the lower value for mlock safety.
+	ramMB := mc.totalRAMMB
+	if runtimeLimitMB := detectRuntimeMemoryMB(); runtimeLimitMB > 0 && (ramMB <= 0 || runtimeLimitMB < ramMB) {
+		ramMB = runtimeLimitMB
+	}
+	if ramMB <= 0 {
 		return false // Can't determine, skip mlock
 	}
 
@@ -357,13 +414,75 @@ func (mc *ModelCache) shouldUseMlock(modelPath string) bool {
 
 	// Use mlock if RAM is at least 4x the model size
 	// This leaves room for OS, other processes, and KV cache
-	if mc.totalRAMMB >= modelSizeMB*4 {
-		log.Printf("Smart mlock: enabling for %s (model: %dMB, RAM: %dMB)",
-			modelPath, modelSizeMB, mc.totalRAMMB)
+	if ramMB >= modelSizeMB*4 {
+		log.Printf("Smart mlock: enabling for %s (model: %dMB, runtime RAM: %dMB)",
+			modelPath, modelSizeMB, ramMB)
 		return true
 	}
 
 	return false
+}
+
+func detectRuntimeMemoryMB() int64 {
+	var detected int64
+
+	paths := []string{
+		"/sys/fs/cgroup/memory.max",
+		"/sys/fs/cgroup/memory/memory.limit_in_bytes",
+	}
+
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		value := strings.TrimSpace(string(data))
+		if value == "" || value == "max" {
+			continue
+		}
+		bytes, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || bytes <= 0 {
+			continue
+		}
+		// Ignore sentinel "unlimited" values from cgroup v1.
+		if bytes > 1<<60 {
+			continue
+		}
+		mb := bytes / (1024 * 1024)
+		if detected == 0 || mb < detected {
+			detected = mb
+		}
+	}
+
+	if memInfoMB := detectProcMemTotalMB(); memInfoMB > 0 && (detected == 0 || memInfoMB < detected) {
+		detected = memInfoMB
+	}
+
+	return detected
+}
+
+func detectProcMemTotalMB() int64 {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kb, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil || kb <= 0 {
+			return 0
+		}
+		return kb / 1024
+	}
+
+	return 0
 }
 
 // autoDetectGPULayers determines optimal GPU layers based on available VRAM
@@ -631,7 +750,6 @@ func (mc *ModelCache) doLoad(modelID, modelPath, projectorPath string, modelSize
 		"-np", fmt.Sprintf("%d", parallelSlots), // Parallel slots
 		"-b", fmt.Sprintf("%d", batchSize), // Batch size
 		"--no-warmup", // Skip token generation warmup
-		"-fit", "off", // Skip slow memory fitting (saves 20-30s on startup)
 	}
 
 	// Add CPU thread count (critical for performance)
@@ -741,10 +859,12 @@ func (mc *ModelCache) doLoad(modelID, modelPath, projectorPath string, modelSize
 		ModelID:       modelID,
 		Port:          port,
 		Cmd:           cmd,
+		ExitDone:      make(chan struct{}),
 		LastAccess:    time.Now(),
 		ModelPath:     modelPath,
 		ProjectorPath: projectorPath,
 	}
+	instance.startExitWatcher()
 
 	mc.instances[modelID] = instance
 
@@ -755,9 +875,9 @@ func (mc *ModelCache) doLoad(modelID, modelPath, projectorPath string, modelSize
 	if err := mc.waitForReady(port, modelID); err != nil {
 		// Cleanup on failure - re-acquire lock
 		mc.mu.Lock()
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-			cmd.Wait()
+		if instance.Cmd != nil && instance.Cmd.Process != nil {
+			instance.Cmd.Process.Kill()
+			instance.waitForExit(2 * time.Second)
 		}
 		delete(mc.instances, modelID)
 		delete(mc.portToModel, port)
@@ -834,22 +954,15 @@ func (mc *ModelCache) unloadInternal(modelID string) error {
 		}
 
 		// Wait briefly for graceful shutdown
-		done := make(chan error, 1)
-		go func() {
-			_, err := instance.Cmd.Process.Wait()
-			done <- err
-		}()
-
-		select {
-		case <-done:
+		if _, exited := instance.waitForExit(2 * time.Second); exited {
 			// Process exited gracefully
-		case <-time.After(2 * time.Second):
+		} else {
 			// Force kill if still running
 			log.Printf("Force killing llama-server for %s (did not respond to SIGTERM)", modelID)
 			if err := instance.Cmd.Process.Kill(); err != nil {
 				log.Printf("Warning: error killing llama-server for %s: %v", modelID, err)
 			}
-			instance.Cmd.Wait()
+			instance.waitForExit(2 * time.Second)
 		}
 	}
 
@@ -878,7 +991,7 @@ func (mc *ModelCache) cleanupInstance(modelID string) {
 	// Kill the process
 	if instance.Cmd != nil && instance.Cmd.Process != nil {
 		instance.Cmd.Process.Kill()
-		instance.Cmd.Wait()
+		instance.waitForExit(2 * time.Second)
 	}
 
 	// Clean up tracking maps
@@ -960,17 +1073,20 @@ func (mc *ModelCache) waitForReady(port int, modelID string) error {
 		defer mc.mmapWarmer.Resume()
 	}
 
-	// Phase 1: Wait for server process to start (up to 15 seconds)
+	// Phase 1: Wait for server process to start. Some llama-server versions do
+	// not answer /health until the model is mostly loaded, so keep this generous.
 	// Fast 200ms polling for quick detection
 	serverStarted := false
-	startupDeadline := time.Now().Add(15 * time.Second)
+	startupTimeout := 120 * time.Second
+	startupDeadline := time.Now().Add(startupTimeout)
+	startupStart := time.Now()
 	attempt := 0
 
 	for time.Now().Before(startupDeadline) {
 		// Update progress: 15-40% during server startup
 		if mc.loadingTracker != nil {
-			elapsed := time.Since(startupDeadline.Add(-15 * time.Second))
-			progress := 15 + int(elapsed.Seconds()*25/15)
+			elapsed := time.Since(startupStart)
+			progress := 15 + int(elapsed.Seconds()*25/startupTimeout.Seconds())
 			if progress > 40 {
 				progress = 40
 			}
@@ -978,6 +1094,17 @@ func (mc *ModelCache) waitForReady(port int, modelID string) error {
 		}
 
 		time.Sleep(200 * time.Millisecond)
+		instance, exists := mc.instances[mc.portToModel[port]]
+		if exists {
+			if err, exited := instance.exitStatus(); exited {
+				return fmt.Errorf("llama-server on port %d exited during startup: %s", port, processExitMessage(err))
+			}
+			if instance.Cmd.Process != nil {
+				if err := instance.Cmd.Process.Signal(syscall.Signal(0)); err != nil {
+					return fmt.Errorf("llama-server on port %d exited during startup: %w", port, err)
+				}
+			}
+		}
 		resp, err := httpClient.Get(healthURL)
 		if err == nil {
 			resp.Body.Close()
@@ -989,7 +1116,7 @@ func (mc *ModelCache) waitForReady(port int, modelID string) error {
 	}
 
 	if !serverStarted {
-		return fmt.Errorf("llama-server on port %d did not start within 15 seconds", port)
+		return fmt.Errorf("llama-server on port %d did not start within %s", port, startupTimeout)
 	}
 
 	// Update tracker - server started, now loading model
@@ -1023,8 +1150,10 @@ func (mc *ModelCache) waitForReady(port int, modelID string) error {
 
 		// Check if process is still running
 		instance, exists := mc.instances[mc.portToModel[port]]
-		if exists && instance.Cmd.ProcessState != nil && instance.Cmd.ProcessState.Exited() {
-			return fmt.Errorf("llama-server on port %d exited unexpectedly", port)
+		if exists {
+			if err, exited := instance.exitStatus(); exited {
+				return fmt.Errorf("llama-server on port %d exited during model load: %s", port, processExitMessage(err))
+			}
 		}
 
 		resp, err := httpClient.Get(modelsURL)
