@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -119,6 +120,58 @@ func TestPreferredWhisperModels(t *testing.T) {
 		if models[i] != want[i] {
 			t.Fatalf("models[%d] = %q, want %q", i, models[i], want[i])
 		}
+	}
+}
+
+func TestTranscribeRejectsWebMWithoutFFmpeg(t *testing.T) {
+	engine := newTestEngine(t)
+	engine.whisperPath = writeTestExecutable(t, filepath.Join(engine.dataDir, "bin", "whisper"))
+	writeTestFile(t, filepath.Join(engine.whisperDir, "ggml-tiny.en.bin"))
+	t.Setenv("PATH", t.TempDir())
+
+	_, err := engine.Transcribe(TranscriptionRequest{
+		File:     strings.NewReader("webm data"),
+		Filename: "voice.webm",
+		Model:    "tiny.en",
+	})
+	if err == nil {
+		t.Fatal("Transcribe should reject WebM when ffmpeg is not available")
+	}
+	if !strings.Contains(err.Error(), "requires ffmpeg") {
+		t.Fatalf("error = %q, want ffmpeg guidance", err.Error())
+	}
+}
+
+func TestParseWhisperJSON(t *testing.T) {
+	response, ok := parseWhisperJSON([]byte(`{
+		"result": {"language": "en"},
+		"transcription": [
+			{"offsets": {"from": 0, "to": 1250}, "text": " Hello"},
+			{"offsets": {"from": 1250, "to": 2500}, "text": " world."}
+		]
+	}`))
+	if !ok {
+		t.Fatal("parseWhisperJSON should parse whisper.cpp JSON output")
+	}
+	if response.Text != "Hello world." {
+		t.Fatalf("Text = %q, want %q", response.Text, "Hello world.")
+	}
+	if response.Language != "en" {
+		t.Fatalf("Language = %q, want en", response.Language)
+	}
+	if len(response.Segments) != 2 {
+		t.Fatalf("len(Segments) = %d, want 2", len(response.Segments))
+	}
+	if response.Segments[1].Start != 1.25 || response.Segments[1].End != 2.5 || response.Segments[1].Text != "world." {
+		t.Fatalf("Segments[1] = %+v, want start/end/text from JSON", response.Segments[1])
+	}
+}
+
+func TestCleanWhisperTextRemovesTimestamps(t *testing.T) {
+	got := cleanWhisperText("[00:00:00.000 --> 00:00:01.000]   Hello\n[00:00:01.000 --> 00:00:02.000] world")
+	want := "Hello\nworld"
+	if got != want {
+		t.Fatalf("cleanWhisperText() = %q, want %q", got, want)
 	}
 }
 

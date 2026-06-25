@@ -66,6 +66,7 @@ RUN apk add --no-cache \
     build-base \
     cmake \
     curl \
+    ffmpeg \
     git \
     linux-headers \
     libstdc++ \

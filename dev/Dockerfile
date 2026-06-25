@@ -45,6 +45,7 @@ FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
+    ffmpeg \
     libgomp1 \
     libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
@@ -139,4 +140,3 @@ USER offgrid
 
 # Run startup script
 ENTRYPOINT ["/usr/local/bin/start.sh"]
-

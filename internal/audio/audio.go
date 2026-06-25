@@ -284,7 +284,7 @@ func (e *Engine) Transcribe(req TranscriptionRequest) (*TranscriptionResponse, e
 	// Get the original filename extension to determine format
 	ext := ".wav"
 	if req.Filename != "" {
-		ext = filepath.Ext(req.Filename)
+		ext = strings.ToLower(filepath.Ext(req.Filename))
 		if ext == "" {
 			ext = ".wav"
 		}
@@ -304,23 +304,26 @@ func (e *Engine) Transcribe(req TranscriptionRequest) (*TranscriptionResponse, e
 	}
 	tempFile.Close()
 
-	// Convert to WAV if not already WAV (whisper works best with 16kHz WAV)
+	// Convert to WAV if not already WAV (whisper works best with 16kHz WAV).
+	// Browser microphone recordings are usually WebM/Opus, which whisper.cpp
+	// cannot decode directly.
 	wavPath := tempPath
 	if ext != ".wav" {
 		wavPath = tempPath + ".wav"
 		defer os.Remove(wavPath)
 
-		// Try ffmpeg conversion
 		ffmpegPath, _ := exec.LookPath("ffmpeg")
 		if ffmpegPath != "" {
 			cmd := exec.Command(ffmpegPath, "-y", "-i", tempPath, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavPath)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
 			if err := cmd.Run(); err != nil {
-				// Fallback: try using the original file directly
-				wavPath = tempPath
+				return nil, fmt.Errorf("failed to convert %s audio to WAV with ffmpeg: %w, stderr: %s", ext, err, strings.TrimSpace(stderr.String()))
 			}
-		} else {
-			// No ffmpeg, try using original file directly (whisper may still work)
+		} else if isWhisperNativeAudio(ext) {
 			wavPath = tempPath
+		} else {
+			return nil, fmt.Errorf("audio format %s requires ffmpeg for conversion; install ffmpeg or upload WAV, MP3, FLAC, or OGG audio", ext)
 		}
 	}
 
@@ -347,10 +350,21 @@ func (e *Engine) Transcribe(req TranscriptionRequest) (*TranscriptionResponse, e
 		numCPU = 1
 	}
 
+	outputBaseFile, err := os.CreateTemp(e.tempDir, "whisper-output-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create whisper output file: %w", err)
+	}
+	outputBase := outputBaseFile.Name()
+	outputBaseFile.Close()
+	os.Remove(outputBase)
+	defer os.Remove(outputBase)
+	defer os.Remove(outputBase + ".json")
+
 	args := []string{
 		"-m", modelPath,
 		"-f", wavPath,
-		"-oj",                           // Output JSON
+		"-oj", // Output JSON sidecar
+		"-of", outputBase,
 		"-t", fmt.Sprintf("%d", numCPU), // Use multiple threads
 	}
 
@@ -382,41 +396,91 @@ func (e *Engine) Transcribe(req TranscriptionRequest) (*TranscriptionResponse, e
 		return nil, fmt.Errorf("whisper failed: %w, stderr: %s", err, stderr.String())
 	}
 
-	// Parse JSON output
+	output := stdout.String()
+	jsonOutput := []byte(output)
+	if data, err := os.ReadFile(outputBase + ".json"); err == nil && len(bytes.TrimSpace(data)) > 0 {
+		jsonOutput = data
+	}
+
+	if response, ok := parseWhisperJSON(jsonOutput); ok {
+		return response, nil
+	}
+
+	return &TranscriptionResponse{
+		Text: cleanWhisperText(output),
+	}, nil
+}
+
+func isWhisperNativeAudio(ext string) bool {
+	switch strings.ToLower(ext) {
+	case ".flac", ".mp3", ".ogg", ".wav":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseWhisperJSON(data []byte) (*TranscriptionResponse, bool) {
 	var result struct {
+		Result struct {
+			Language string `json:"language"`
+		} `json:"result"`
 		Transcription []struct {
-			Timestamps struct {
-				From string `json:"from"`
-				To   string `json:"to"`
-			} `json:"timestamps"`
+			Offsets struct {
+				From int `json:"from"`
+				To   int `json:"to"`
+			} `json:"offsets"`
 			Text string `json:"text"`
 		} `json:"transcription"`
 	}
 
-	// Try to parse as JSON, fallback to plain text
-	output := stdout.String()
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		// Plain text output
-		return &TranscriptionResponse{
-			Text: strings.TrimSpace(output),
-		}, nil
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, false
+	}
+	if result.Result.Language == "" && len(result.Transcription) == 0 {
+		return nil, false
 	}
 
-	// Build response
 	var fullText strings.Builder
 	var segments []Segment
 	for i, t := range result.Transcription {
 		fullText.WriteString(t.Text)
 		segments = append(segments, Segment{
-			ID:   i,
-			Text: t.Text,
+			ID:    i,
+			Start: float64(t.Offsets.From) / 1000,
+			End:   float64(t.Offsets.To) / 1000,
+			Text:  strings.TrimSpace(t.Text),
 		})
 	}
 
 	return &TranscriptionResponse{
 		Text:     strings.TrimSpace(fullText.String()),
+		Language: result.Result.Language,
 		Segments: segments,
-	}, nil
+	}, true
+}
+
+func cleanWhisperText(output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return ""
+	}
+
+	lines := strings.Split(output, "\n")
+	cleaned := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			if end := strings.Index(line, "]"); end >= 0 && strings.Contains(line[:end], "-->") {
+				line = strings.TrimSpace(line[end+1:])
+			}
+		}
+		if line != "" {
+			cleaned = append(cleaned, line)
+		}
+	}
+
+	return strings.Join(cleaned, "\n")
 }
 
 // findModelPath finds the full path to a whisper model
