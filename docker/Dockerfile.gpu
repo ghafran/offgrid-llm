@@ -63,7 +63,11 @@ FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    cmake \
     curl \
+    g++ \
+    git \
+    make \
     wget \
     && rm -rf /var/lib/apt/lists/*
 

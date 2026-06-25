@@ -519,6 +519,9 @@ func (e *Engine) DownloadPiperVoice(name string, progress DownloadProgressFunc) 
 // DownloadWhisperBinary downloads whisper.cpp binary if not already installed
 // The binary is normally bundled with the OffGrid installation, so this is a fallback
 func (e *Engine) DownloadWhisperBinary(progress DownloadProgressFunc) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	// Check if already installed (from bundle or previous download)
 	if e.whisperPath != "" {
 		fmt.Println("Whisper.cpp is already installed")
@@ -606,6 +609,7 @@ func (e *Engine) buildWhisperFromSource(progress DownloadProgressFunc) error {
 
 	// Copy all .so files from build directories
 	buildLibDirs := []string{
+		filepath.Join(repoDir, "build", "bin"),
 		filepath.Join(repoDir, "build", "src"),
 		filepath.Join(repoDir, "build", "ggml", "src"),
 	}
@@ -614,7 +618,9 @@ func (e *Engine) buildWhisperFromSource(progress DownloadProgressFunc) error {
 		files, _ := filepath.Glob(filepath.Join(dir, "*.so*"))
 		for _, f := range files {
 			destLib := filepath.Join(libDir, filepath.Base(f))
-			copyFile(f, destLib)
+			if err := copyFile(f, destLib); err != nil {
+				return fmt.Errorf("failed to copy whisper library %s: %w", filepath.Base(f), err)
+			}
 		}
 	}
 

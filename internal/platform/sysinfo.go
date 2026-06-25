@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/takuphilchan/offgrid-llm/internal/resource"
 )
 
 // SystemInfo holds detected system information
@@ -37,6 +39,12 @@ func GetSystemInfo() SystemInfo {
 
 	// Detect Memory
 	info.TotalMemory, info.FreeMemory = detectMemory()
+	totalMB, freeMB, _ := resource.ApplyMemoryOverridesMB(
+		int64(info.TotalMemory/(1024*1024)),
+		int64(info.FreeMemory/(1024*1024)),
+	)
+	info.TotalMemory = uint64(totalMB) * 1024 * 1024
+	info.FreeMemory = uint64(freeMB) * 1024 * 1024
 
 	// Detect GPU
 	info.GPU, info.GPUMemory = detectGPU()

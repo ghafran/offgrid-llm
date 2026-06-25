@@ -62,10 +62,15 @@ FROM alpine:latest
 # Install runtime dependencies
 RUN apk add --no-cache \
     ca-certificates \
+    bash \
+    build-base \
+    cmake \
     curl \
-    wget \
+    git \
+    linux-headers \
     libstdc++ \
-    libgcc
+    libgcc \
+    wget
 
 # Create non-root user
 RUN addgroup -g 1000 offgrid && \

@@ -90,6 +90,32 @@ func (m *Monitor) updateStats() {
 		}
 	}
 
+	totalMB := int64(vmStat.Total / 1024 / 1024)
+	availableMB := int64(vmStat.Available / 1024 / 1024)
+	if availableMB == 0 && vmStat.Total >= vmStat.Used {
+		availableMB = int64((vmStat.Total - vmStat.Used) / 1024 / 1024)
+	}
+	usedMB := int64(vmStat.Used / 1024 / 1024)
+
+	if overrideTotalMB, overrideAvailableMB, ok := ApplyMemoryOverridesMB(totalMB, availableMB); ok {
+		totalMB = overrideTotalMB
+		availableMB = overrideAvailableMB
+		if totalMB >= availableMB {
+			usedMB = totalMB - availableMB
+		}
+	}
+	if usedMB < 0 {
+		usedMB = 0
+	}
+	if totalMB > 0 && usedMB > totalMB {
+		usedMB = totalMB
+	}
+
+	memoryPercent := 0.0
+	if totalMB > 0 {
+		memoryPercent = float64(usedMB) / float64(totalMB) * 100
+	}
+
 	// Get CPU usage
 	cpuPercent, err := cpu.Percent(0, false)
 	cpuUsage := 0.0
@@ -110,9 +136,9 @@ func (m *Monitor) updateStats() {
 
 	m.stats = Stats{
 		CPUUsagePercent:    cpuUsage,
-		MemoryUsedMB:       vmStat.Used / 1024 / 1024,
-		MemoryTotalMB:      vmStat.Total / 1024 / 1024,
-		MemoryUsagePercent: vmStat.UsedPercent,
+		MemoryUsedMB:       uint64(usedMB),
+		MemoryTotalMB:      uint64(totalMB),
+		MemoryUsagePercent: memoryPercent,
 		DiskUsedGB:         diskUsedGB,
 		DiskTotalGB:        diskTotalGB,
 		DiskUsagePercent:   diskPercent,

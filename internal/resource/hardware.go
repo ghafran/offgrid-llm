@@ -37,6 +37,7 @@ func DetectResources() (*SystemResources, error) {
 	if err := detectRAM(res); err != nil {
 		return nil, fmt.Errorf("failed to detect RAM: %w", err)
 	}
+	res.TotalRAM, res.AvailableRAM, _ = ApplyMemoryOverridesMB(res.TotalRAM, res.AvailableRAM)
 
 	// Detect GPU
 	detectGPU(res)
