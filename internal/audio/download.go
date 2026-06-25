@@ -722,13 +722,19 @@ func (e *Engine) DownloadPiperBinary(progress DownloadProgressFunc) error {
 	// Make executable
 	piperPath := filepath.Join(e.piperDir, binaryName)
 	// Check if piper is in a subdirectory (piper releases extract to piper/)
-	if _, err := os.Stat(piperPath); os.IsNotExist(err) {
+	if !isRegularFile(piperPath) {
 		piperPath = filepath.Join(e.piperDir, "piper", binaryName)
+	}
+	if !isRegularFile(piperPath) {
+		return fmt.Errorf("piper binary not found after extraction: checked %s and %s", filepath.Join(e.piperDir, binaryName), filepath.Join(e.piperDir, "piper", binaryName))
 	}
 
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(piperPath, 0755); err != nil {
 			return fmt.Errorf("failed to make piper executable: %w", err)
+		}
+		if !isExecutableFile(piperPath) {
+			return fmt.Errorf("piper binary is not executable after chmod: %s", piperPath)
 		}
 	}
 

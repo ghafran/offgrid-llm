@@ -25,7 +25,8 @@ function initAudioTab() {
 // Pre-warm whisper by doing a tiny transcription in the background
 async function preWarmWhisper() {
     try {
-        const model = document.getElementById('voiceAssistantWhisper')?.value || 'tiny.en';
+        const model = document.getElementById('voiceAssistantWhisper')?.value || '';
+        if (!model) return;
         console.log('[AUDIO] Pre-warming whisper model:', model);
         
         // Create a tiny silent audio blob (100ms of silence)
@@ -607,7 +608,7 @@ function onVoiceWhisperChange() {
 
 function checkWhisperModelCompatibility() {
     const lang = document.getElementById('voiceAssistantLang')?.value || 'en';
-    const model = document.getElementById('voiceAssistantWhisper')?.value || 'tiny.en';
+    const model = document.getElementById('voiceAssistantWhisper')?.value || '';
     const hint = document.getElementById('whisperModelHint');
     
     // Show warning if non-English language selected with English-only model
@@ -1155,11 +1156,13 @@ async function transcribeChatVoice(audioBlob) {
     
     try {
         // Use Chat tab voice settings
-        const whisperModel = document.getElementById('chatWhisperModel')?.value || localStorage.getItem('chatWhisperModel') || 'tiny.en';
+        const whisperModel = document.getElementById('chatWhisperModel')?.value || localStorage.getItem('chatWhisperModel') || '';
         const language = document.getElementById('chatVoiceLang')?.value || localStorage.getItem('chatVoiceLang') || 'en';
         const formData = new FormData();
         formData.append('file', new File([audioBlob], 'voice.webm', { type: audioBlob.type }));
-        formData.append('model', whisperModel);
+        if (whisperModel) {
+            formData.append('model', whisperModel);
+        }
         if (language && language !== 'auto') {
             formData.append('language', language);
         }
@@ -1433,11 +1436,13 @@ async function processVoiceChat(audioBlob) {
     try {
         // Step 1: Transcribe audio
         statusEl.textContent = 'Transcribing...';
-        const model = document.getElementById('voiceAssistantWhisper')?.value || 'tiny.en';
+        const model = document.getElementById('voiceAssistantWhisper')?.value || '';
         const language = document.getElementById('voiceAssistantLang')?.value || 'en';
         const formData = new FormData();
         formData.append('file', new File([audioBlob], 'voice.webm', { type: audioBlob.type }));
-        formData.append('model', model);
+        if (model) {
+            formData.append('model', model);
+        }
         if (language && language !== 'auto') {
             formData.append('language', language);
         }
@@ -1613,7 +1618,7 @@ async function speakText(text) {
         // Use Voice Assistant's voice dropdown, fallback to TTS section dropdown
         const voice = document.getElementById('voiceAssistantVoice')?.value || 
                       document.getElementById('ttsVoice')?.value || 
-                      'en_US-amy-medium';
+                      '';
         
         console.log('[TTS] Speaking:', cleanText.substring(0, 50) + '...');
         
@@ -2103,15 +2108,16 @@ async function processJarvisVoice(audioBlob) {
         // Step 1: Transcribe
         updateJarvisState('Transcribing...');
         
-        // Prefer tiny.en for speed, fallback to base
-        const model = document.getElementById('voiceAssistantWhisper')?.value || 'tiny.en';
+        const model = document.getElementById('voiceAssistantWhisper')?.value || '';
         const language = document.getElementById('voiceAssistantLang')?.value || 'en';
         
         console.log('[JARVIS] Transcribing audio:', audioBlob.size, 'bytes, type:', audioBlob.type);
         
         const formData = new FormData();
         formData.append('file', new File([audioBlob], 'voice.webm', { type: audioBlob.type }));
-        formData.append('model', model);
+        if (model) {
+            formData.append('model', model);
+        }
         if (language && language !== 'auto') {
             formData.append('language', language);
         }
@@ -2476,4 +2482,3 @@ if (document.readyState === 'loading') {
 } else {
     initJarvisMode();
 }
-

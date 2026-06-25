@@ -130,6 +130,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if e.piperPath == "" {
 		e.piperPath = e.findPiper()
 	}
+	e.preparePiperRuntime(e.piperPath)
 
 	return e, nil
 }
@@ -144,7 +145,7 @@ func (e *Engine) findWhisper() string {
 	// Check in whisper directory
 	for _, name := range names {
 		path := filepath.Join(e.whisperDir, name)
-		if _, err := os.Stat(path); err == nil {
+		if isExecutableFile(path) {
 			return path
 		}
 	}
@@ -175,7 +176,8 @@ func (e *Engine) findPiper() string {
 	for _, dir := range searchDirs {
 		for _, name := range names {
 			path := filepath.Join(dir, name)
-			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			if isExecutableFile(path) {
+				e.preparePiperRuntime(path)
 				return path
 			}
 		}
@@ -191,68 +193,83 @@ func (e *Engine) findPiper() string {
 	return ""
 }
 
+func (e *Engine) preparePiperRuntime(piperPath string) {
+	if runtime.GOOS != "linux" {
+		return
+	}
+
+	rel, err := filepath.Rel(e.piperDir, piperPath)
+	if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		return
+	}
+
+	createLibSymlinks(filepath.Dir(piperPath))
+}
+
+func isRegularFile(path string) bool {
+	if path == "" {
+		return false
+	}
+
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+
+	return true
+}
+
+func isExecutableFile(path string) bool {
+	if !isRegularFile(path) {
+		return false
+	}
+
+	if runtime.GOOS == "windows" {
+		return true
+	}
+
+	info, err := os.Stat(path)
+	return err == nil && info.Mode()&0111 != 0
+}
+
 // HasWhisperBinary checks if whisper binary is available
 func (e *Engine) HasWhisperBinary() bool {
-	return e.whisperPath != ""
+	return isExecutableFile(e.whisperPath)
 }
 
 // HasPiperBinary checks if piper binary is available
 func (e *Engine) HasPiperBinary() bool {
-	return e.piperPath != ""
+	return isExecutableFile(e.piperPath)
 }
 
 // IsASRAvailable checks if speech-to-text is available
 func (e *Engine) IsASRAvailable() bool {
-	return e.whisperPath != "" && e.hasWhisperModel()
+	return e.HasWhisperBinary() && e.hasWhisperModel()
 }
 
 // IsTTSAvailable checks if text-to-speech is available
 func (e *Engine) IsTTSAvailable() bool {
-	return e.piperPath != "" && e.hasPiperModel()
+	return e.HasPiperBinary() && e.hasPiperModel()
 }
 
 // hasWhisperModel checks if a whisper model is available
 func (e *Engine) hasWhisperModel() bool {
-	model := e.whisperModel
-	if model == "" {
-		model = "base.en"
+	if e.whisperModel != "" {
+		return e.findModelPath(e.whisperModel) != ""
 	}
 
-	// Check for model file
-	patterns := []string{
-		filepath.Join(e.whisperDir, "ggml-"+model+".bin"),
-		filepath.Join(e.whisperDir, model+".bin"),
-	}
-
-	for _, pattern := range patterns {
-		if _, err := os.Stat(pattern); err == nil {
-			return true
-		}
-	}
-
-	return false
+	models, _ := e.ListWhisperModels()
+	return len(models) > 0
 }
 
 // hasPiperModel checks if a piper model is available
 func (e *Engine) hasPiperModel() bool {
-	model := e.piperModel
-	if model == "" {
-		model = "en_US-amy-medium"
+	if e.piperModel != "" {
+		return e.findPiperModelPath(e.piperModel) != ""
 	}
 
-	// Check for model file
-	patterns := []string{
-		filepath.Join(e.piperDir, model+".onnx"),
-		filepath.Join(e.piperDir, "voices", model+".onnx"),
-	}
-
-	for _, pattern := range patterns {
-		if _, err := os.Stat(pattern); err == nil {
-			return true
-		}
-	}
-
-	return false
+	voices, _ := e.ListVoices()
+	return len(voices) > 0
 }
 
 // Transcribe converts speech to text using Whisper
@@ -312,13 +329,13 @@ func (e *Engine) Transcribe(req TranscriptionRequest) (*TranscriptionResponse, e
 	if model == "" {
 		model = e.whisperModel
 	}
-	if model == "" {
-		model = "base.en"
-	}
 
 	modelPath := e.findModelPath(model)
 	if modelPath == "" {
-		return nil, fmt.Errorf("whisper model not found: %s", model)
+		model, modelPath = e.findInstalledWhisperModel()
+	}
+	if modelPath == "" {
+		return nil, fmt.Errorf("whisper model not found: %s", req.Model)
 	}
 
 	// Get number of CPU threads (use most available for speed)
@@ -404,6 +421,10 @@ func (e *Engine) Transcribe(req TranscriptionRequest) (*TranscriptionResponse, e
 
 // findModelPath finds the full path to a whisper model
 func (e *Engine) findModelPath(model string) string {
+	if model == "" {
+		return ""
+	}
+
 	patterns := []string{
 		filepath.Join(e.whisperDir, "ggml-"+model+".bin"),
 		filepath.Join(e.whisperDir, model+".bin"),
@@ -417,6 +438,17 @@ func (e *Engine) findModelPath(model string) string {
 	}
 
 	return ""
+}
+
+func (e *Engine) findInstalledWhisperModel() (string, string) {
+	models, _ := e.ListWhisperModels()
+	for _, model := range preferredWhisperModels(models) {
+		if path := e.findModelPath(model); path != "" {
+			return model, path
+		}
+	}
+
+	return "", ""
 }
 
 // Speak converts text to speech using Piper
@@ -450,13 +482,13 @@ func (e *Engine) Speak(req SpeechRequest) (io.Reader, error) {
 	if model == "" {
 		model = e.piperModel
 	}
-	if model == "" {
-		model = "en_US-amy-medium"
-	}
 
 	modelPath := e.findPiperModelPath(model)
 	if modelPath == "" {
-		return nil, fmt.Errorf("piper model not found: %s (requires both .onnx and .onnx.json files). Try running: offgrid setup piper --voice %s", model, model)
+		model, modelPath = e.findInstalledPiperVoice()
+	}
+	if modelPath == "" {
+		return nil, fmt.Errorf("piper model not found: %s (requires both .onnx and .onnx.json files). Try running: offgrid setup piper --voice %s", req.Voice, req.Voice)
 	}
 
 	// Build piper command
@@ -498,6 +530,10 @@ func (e *Engine) Speak(req SpeechRequest) (io.Reader, error) {
 // findPiperModelPath finds the full path to a piper model
 // Returns empty string if either the .onnx or .onnx.json file is missing
 func (e *Engine) findPiperModelPath(model string) string {
+	if model == "" {
+		return ""
+	}
+
 	patterns := []string{
 		filepath.Join(e.piperDir, model+".onnx"),
 		filepath.Join(e.piperDir, "voices", model+".onnx"),
@@ -517,6 +553,17 @@ func (e *Engine) findPiperModelPath(model string) string {
 	return ""
 }
 
+func (e *Engine) findInstalledPiperVoice() (string, string) {
+	voices, _ := e.ListVoices()
+	for _, voice := range voices {
+		if path := e.findPiperModelPath(voice.Name); path != "" {
+			return voice.Name, path
+		}
+	}
+
+	return "", ""
+}
+
 // ListVoices returns available TTS voices
 func (e *Engine) ListVoices() ([]VoiceInfo, error) {
 	var voices []VoiceInfo
@@ -530,6 +577,10 @@ func (e *Engine) ListVoices() ([]VoiceInfo, error) {
 	for _, pattern := range patterns {
 		matches, _ := filepath.Glob(pattern)
 		for _, match := range matches {
+			if _, err := os.Stat(match + ".json"); err != nil {
+				continue
+			}
+
 			name := strings.TrimSuffix(filepath.Base(match), ".onnx")
 			voice := VoiceInfo{
 				Name:  name,
@@ -567,6 +618,39 @@ func (e *Engine) ListWhisperModels() ([]string, error) {
 	}
 
 	return models, nil
+}
+
+func preferredWhisperModels(models []string) []string {
+	if len(models) < 2 {
+		return models
+	}
+
+	preferredOrder := []string{"tiny.en", "tiny", "base.en", "base", "small.en", "small", "medium.en", "medium", "large-v3"}
+	preferred := make([]string, 0, len(models))
+
+	for _, name := range preferredOrder {
+		for _, model := range models {
+			if model == name {
+				preferred = append(preferred, model)
+				break
+			}
+		}
+	}
+
+	for _, model := range models {
+		found := false
+		for _, existing := range preferred {
+			if existing == model {
+				found = true
+				break
+			}
+		}
+		if !found {
+			preferred = append(preferred, model)
+		}
+	}
+
+	return preferred
 }
 
 // Status returns the audio engine status
